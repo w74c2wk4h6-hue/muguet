@@ -1,55 +1,85 @@
-name: "iOS IPA Build"
+name: Build IPA
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ] # Hangi branch tetikleyecekse (main, master vb.)
+    branches: [ main, master ]
 
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
+      - name: Checkout (alt modüllerle)
         uses: actions/checkout@v4
-
-      - name: Install Apple Certificate and Provisioning Profile
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
-          BUILD_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
-          KEYCHAIN_PASSWORD: "temporary_password"
-        run: |
-          # Keychain oluşturma ve sertifikayı içeri aktarma
-          echo $BUILD_CERTIFICATE_BASE64 | base64 --decode --output app_dist.p12
-          echo $BUILD_PROVISIONING_PROFILE_BASE64 | base64 --decode --output app_profile.mobileprovision
-          
-          xcrun security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          xcrun security default-keychain -s build.keychain
-          xcrun security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          xcrun security import app_dist.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
-          xcrun security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          
-          # Provisioning profile'ı yerine taşıma
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp app_profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
-
-      - name: Select Xcode Version
-        run: sudo xcode-select -s /Applications/Xcode.app
-
-      - name: Build Archive
-        run: |
-          xcodebuild -workspace ios/*.xcworkspace -scheme "YourSchemeName" -sdk iphoneos -configuration Release archive -archivePath $PWD/build/App.xcarchive
-          # Not: Eğer saf native projeyse ios/ önekini kaldırıp direkt .xcodeproj/.xcworkspace adını yazın.
-
-      - name: Export IPA
-        env:
-          EXPORT_OPTIONS_PLIST: ${{ secrets.EXPORT_OPTIONS_PLIST }}
-        run: |
-          # exportOptions.plist dosyasını oluşturun (AdHoc veya AppStore için)
-          xcodebuild -exportArchive -archivePath $PWD/build/App.xcarchive -exportOptionsPlist exportOptions.plist -exportPath $PWD/build/out
-
-      - name: Upload IPA Artifact
-        uses: actions/actions-artifact@v3
         with:
-          name: ios-app-ipa
-          path: build/out/*.ipa
+          submodules: recursive
+
+      - name: Proje ve scheme'i bul
+        id: detect
+        run: |
+          set -e
+          xcodebuild -version
+
+          # Önce workspace, yoksa xcodeproj (Pods ve paket içindekileri atla)
+          WS=$(find . -maxdepth 3 -name "*.xcworkspace" -not -path "*/Pods/*" -not -path "*.xcodeproj/*" | head -1)
+          if [ -n "$WS" ]; then
+            FLAG="-workspace"; FILE="$WS"
+          else
+            PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -not -path "*/Pods/*" | head -1)
+            FLAG="-project"; FILE="$PROJ"
+          fi
+          if [ -z "$FILE" ]; then
+            echo "Xcode projesi bulunamadı!"; exit 1
+          fi
+
+          xcodebuild -list $FLAG "$FILE"
+
+          SCHEME=$(xcodebuild -list -json $FLAG "$FILE" | jq -r '(.workspace // .project).schemes[0]')
+          echo "Dosya: $FILE  Scheme: $SCHEME"
+
+          echo "flag=$FLAG" >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Swift paketlerini çöz
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            ${{ steps.detect.outputs.flag }} "${{ steps.detect.outputs.file }}" \
+            -scheme "${{ steps.detect.outputs.scheme }}"
+
+      - name: Derle (imzasız)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            ${{ steps.detect.outputs.flag }} "${{ steps.detect.outputs.file }}" \
+            -scheme "${{ steps.detect.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/App.xcarchive \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: IPA oluştur
+        run: |
+          mkdir -p Payload
+          cp -R build/App.xcarchive/Products/Applications/*.app Payload/
+          brew install ldid
+          APP=$(ls -d Payload/*.app | head -1)
+          EXE=$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP/Info.plist")
+          ldid -S "$APP/$EXE"
+          NAME=$(basename "$APP" .app)
+          zip -qry "$NAME.ipa" Payload
+          echo "IPA_NAME=$NAME" >> "$GITHUB_ENV"
+          unzip -l "$NAME.ipa" | head -20
+
+      - name: IPA'yı yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}-ipa
+          path: ${{ env.IPA_NAME }}.ipa
